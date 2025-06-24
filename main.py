@@ -171,12 +171,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Main app
 def main():
     init_db()
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .updater(None)  # Fix for newer versions
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("addtask", start_add_task)],
