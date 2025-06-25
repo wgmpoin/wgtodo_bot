@@ -1,9 +1,9 @@
 import os
 import logging
 import threading
-import psycopg2
+import psycopg2 # Menggunakan PostgreSQL
 from datetime import datetime
-from flask import Flask
+from flask import Flask # Untuk health check
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,12 +18,12 @@ from dotenv import load_dotenv
 # ======================================
 # INITIAL SETUP
 # ======================================
-load_dotenv()
+load_dotenv() # Memuat variabel dari .env (hanya untuk pengembangan lokal)
 
 # Konfigurasi variabel lingkungan
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-PORT = int(os.getenv("PORT", "10000"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) # Default 0 jika tidak ada
+PORT = int(os.getenv("PORT", "10000")) # Port untuk Flask health check
 
 # Validasi variabel penting
 if not BOT_TOKEN:
@@ -31,8 +31,6 @@ if not BOT_TOKEN:
     exit(1)
 if OWNER_ID == 0:
     logger.warning("OWNER_ID not set, admin commands will be disabled.")
-    # OWNER_ID harus diatur untuk admin commands berfungsi
-    # Jika Anda belum menyetelnya, lakukan di Render's Environment Variables
 
 # Flask app untuk Render health checks
 flask_app = Flask(__name__)
@@ -57,6 +55,7 @@ class DatabaseManager:
         if not DATABASE_URL:
             raise ValueError("DATABASE_URL environment variable is not set.")
         try:
+            # sslmode="require" penting untuk koneksi ke Supabase
             return psycopg2.connect(
                 DATABASE_URL,
                 sslmode="require",
@@ -95,6 +94,7 @@ class DatabaseManager:
             logger.info("Database tables initialized successfully.")
         except Exception as e:
             logger.critical(f"Database initialization failed: {e}")
+            # Jika inisialisasi DB gagal, bot tidak bisa berjalan
             raise
 
 # ======================================
@@ -132,7 +132,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if not context.args:
-        await update.message.reply_text("⚠️ Format: `/adduser [ID_TELEGRAM_NUMERIK]`")
+        await update.message.reply_text("⚠️ Format: /adduser [ID_TELEGRAM_NUMERIK]")
         return
     
     conn = None
@@ -142,10 +142,10 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with conn.cursor() as cur:
             cur.execute(
                 "INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
-                (user_id_to_add, update.effective_user.username or "N/A")
+                (user_id_to_add, update.effective_user.username or "N/A") # Simpan username jika ada
             )
             conn.commit()
-        await update.message.reply_text(f"✅ User `{user_id_to_add}` berhasil ditambahkan!")
+        await update.message.reply_text(f"✅ User {user_id_to_add} berhasil ditambahkan!")
         logger.info(f"User {user_id_to_add} added by owner {update.effective_user.id}.")
     except ValueError:
         await update.message.reply_text("⚠️ ID user tidak valid. Mohon masukkan angka.")
@@ -170,10 +170,10 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
             users = cur.fetchall()
         
         if users:
-            msg = "📋 User terdaftar:\n" + "\n".join([f"👤 `{uid}` (@{uname})" if uname != "N/A" else f"👤 `{uid}`" for uid, uname in users])
+            msg = "📋 User terdaftar:\n" + "\n".join([f"👤 {uid} (@{uname})" if uname != "N/A" else f"👤 {uid}" for uid, uname in users])
         else:
             msg = "📭 Tidak ada user terdaftar."
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        await update.message.reply_text(msg)
     except Exception as e:
         logger.error(f"Error listing users by {update.effective_user.id}: {e}")
         await update.message.reply_text("❌ Gagal menampilkan user. Cek log untuk detail.")
@@ -183,6 +183,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # TASK MANAGEMENT (Conversation Handler)
 TASK_TITLE, TASK_RECIPIENTS, TASK_DEADLINE, TASK_NOTE = range(4)
+# task_data tidak lagi dibutuhkan sebagai global dictionary jika kita pakai context.user_data
 
 async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Memulai alur pembuatan tugas."""
@@ -190,14 +191,15 @@ async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔐 Anda belum terdaftar sebagai pengguna bot ini. Silakan hubungi pemilik bot.")
         return ConversationHandler.END
     
-    context.user_data['task_data'] = {} # Inisialisasi data tugas untuk user ini
+    # Inisialisasi data tugas untuk user ini di context.user_data
+    context.user_data['task_data'] = {}
     await update.message.reply_text("📝 Oke, mari buat tugas baru. Apa judul tugasnya?")
     return TASK_TITLE
 
 async def get_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima judul tugas."""
     context.user_data['task_data']['title'] = update.message.text.strip()
-    await update.message.reply_text("👥 Siapa penerima tugas ini? (Mohon gunakan ID numerik Telegram mereka, pisahkan dengan spasi jika lebih dari satu. Contoh: `123456789 987654321`)\n\nKetik `/cancel` untuk membatalkan.")
+    await update.message.reply_text("👥 Siapa penerima tugas ini? (Mohon gunakan ID numerik Telegram mereka, pisahkan dengan spasi jika lebih dari satu. Contoh: `123456789 987654321`)")
     return TASK_RECIPIENTS
 
 async def get_task_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,12 +209,13 @@ async def get_task_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE
     recipient_ids = []
     for r_id_str in recipients_input.split():
         if not r_id_str.isdigit():
-            await update.message.reply_text(f"⚠️ `{r_id_str}` bukan ID numerik yang valid. Mohon masukkan ID numerik Telegram yang dipisahkan spasi.\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-            return TASK_RECIPIENTS
+            await update.message.reply_text(f"⚠️ '{r_id_str}' bukan ID numerik yang valid. Mohon masukkan ID numerik Telegram yang dipisahkan spasi.")
+            return TASK_RECIPIENTS # Kembali ke langkah ini jika ada invalid input
         recipient_ids.append(r_id_str)
 
-    context.user_data['task_data']['recipients'] = " ".join(recipient_ids)
-    await update.message.reply_text("⏰ Kapan deadline tugas ini? Format: `YYYY-MM-DD HH:MM` (Contoh: `2025-07-01 15:00`)\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
+    # Simpan sebagai string ID dipisahkan spasi
+    context.user_data['task_data']['recipients'] = " ".join(recipient_ids) 
+    await update.message.reply_text("⏰ Kapan deadline tugas ini? Format: `YYYY-MM-DD HH:MM` (Contoh: `2025-07-01 15:00`)")
     return TASK_DEADLINE
 
 async def get_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -221,26 +224,22 @@ async def get_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         deadline_str = update.message.text.strip()
         deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
         
+        # Opsional: Validasi deadline tidak di masa lalu
         if deadline_dt < datetime.now():
-            await update.message.reply_text("⚠️ Deadline tidak bisa di masa lalu. Mohon masukkan tanggal dan waktu di masa depan.\n\nKetik `/cancel` untuk membatalkan.")
+            await update.message.reply_text("⚠️ Deadline tidak bisa di masa lalu. Mohon masukkan tanggal dan waktu di masa depan.")
             return TASK_DEADLINE
 
         context.user_data['task_data']['deadline'] = deadline_dt
-        await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?\n\nKetik `/cancel` untuk membatalkan.")
+        await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?")
         return TASK_NOTE
     except ValueError:
-        await update.message.reply_text("⚠️ Format deadline salah. Mohon ikuti format `YYYY-MM-DD HH:MM`. Contoh: `2025-07-01 15:00`\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ Format deadline salah. Mohon ikuti format `YYYY-MM-DD HH:MM`. Contoh: `2025-07-01 15:00`")
         return TASK_DEADLINE
 
 async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima keterangan tugas, menyimpan ke DB, dan mengirim notifikasi."""
     user_id = update.effective_user.id
-    task_data_temp = context.user_data.get('task_data')
-    
-    if not task_data_temp: # Fallback jika data hilang (misal karena bot restart)
-        await update.message.reply_text("❌ Maaf, data pembuatan tugas hilang. Mohon mulai ulang dengan /addtask.")
-        return ConversationHandler.END
-
+    task_data_temp = context.user_data['task_data']
     task_data_temp['note'] = update.message.text.strip()
 
     conn = None
@@ -257,7 +256,7 @@ async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYP
                  task_data_temp['deadline'], 
                  task_data_temp['note']),
             )
-            task_id = cur.fetchone()[0]
+            task_id = cur.fetchone()[0] # Dapatkan ID tugas yang baru dibuat
             conn.commit()
         logger.info(f"Task #{task_id} created by user {user_id}.")
     except Exception as e:
@@ -268,7 +267,8 @@ async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYP
         if conn:
             conn.close()
 
-    if task_id:
+    if task_id: # Hanya kirim notifikasi jika tugas berhasil disimpan
+        # Kirim notifikasi ke penerima
         recipients_list = task_data_temp['recipients'].split()
         for recipient_id_str in recipients_list:
             try:
@@ -286,16 +286,18 @@ async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYP
                 logger.info(f"Notification sent for task #{task_id} to {recipient_chat_id}")
             except Exception as e:
                 logger.warning(f"Gagal kirim notifikasi tugas #{task_id} ke {recipient_id_str}: {e}")
+                # Anda bisa memilih untuk memberi tahu pembuat tugas jika ada penerima yang gagal
         
         await update.message.reply_text(f"✅ Tugas berhasil dibuat dengan ID `#{task_id}` dan notifikasi dikirimkan.")
     
+    # Hapus data sementara setelah selesai
     if 'task_data' in context.user_data:
         del context.user_data['task_data']
     
     return ConversationHandler.END
 
 async def cancel_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Membatalkan alur ConversationHandler pembuatan tugas."""
+    """Membatalkan alur ConversationHandler."""
     if 'task_data' in context.user_data:
         del context.user_data['task_data']
     await update.message.reply_text("❌ Pembuatan tugas dibatalkan.")
@@ -321,8 +323,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Halo {user.first_name}!\n\n"
         "📌 Perintah yang tersedia:\n" + 
-        "\n".join(commands),
-        parse_mode="Markdown"
+        "\n".join(commands)
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,7 +350,7 @@ def setup_bot():
             TASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_deadline)],
             TASK_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task_and_notify)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_task_creation)], # Tambahkan cancel di sini
+        fallbacks=[CommandHandler("cancel", cancel_task_creation)],
     )
     app.add_handler(task_conv_handler)
     # app.add_handler(CommandHandler("listtasks", list_tasks)) # Belum diimplementasi
@@ -370,6 +371,7 @@ def run_flask_server():
         flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     except Exception as e:
         logger.critical(f"Flask server failed to start: {e}")
+        # Jika Flask gagal, mungkin bot tidak akan terdeteksi oleh Render
         os._exit(1) # Keluar dari proses jika Flask gagal
 
 def main():
@@ -388,13 +390,13 @@ def main():
         DatabaseManager.init_db()
     except Exception:
         logger.critical("Database initialization failed. Exiting application.")
-        exit(1)
+        exit(1) # Keluar jika DB gagal diinisialisasi
 
     # Setup dan jalankan bot
     bot_app = setup_bot()
     logger.info("Starting Telegram bot in polling mode...")
     try:
-        bot_app.run_polling(poll_interval=3, timeout=30)
+        bot_app.run_polling(poll_interval=3, timeout=30) # Sesuaikan interval polling jika perlu
     except Exception as e:
         logger.critical(f"Telegram bot polling failed: {e}")
         raise
