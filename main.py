@@ -1,7 +1,8 @@
 import logging
-import psycopg2 # Menggantikan sqlite3
+import psycopg2
 import os
 from datetime import datetime
+from signal import signal, SIGINT, SIGTERM, SIGABRT
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,15 +17,24 @@ from dotenv import load_dotenv
 # Load .env file (hanya untuk pengembangan lokal, di Render pakai Environment Variables)
 load_dotenv()
 
+# Konfigurasi
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL") # Variabel baru untuk koneksi database
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Global variables
+app = None
+task_data = {}
+
+# States untuk ConversationHandler
+JUDUL, PENERIMA, DEADLINE, KETERANGAN = range(4)
 
 # DB setup
 def init_db():
@@ -33,9 +43,7 @@ def init_db():
     try:
         conn = psycopg2.connect(DATABASE_URL)
         c = conn.cursor()
-        # BIGINT untuk user_id karena ID Telegram bisa sangat besar
         c.execute("CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY)")
-        # SERIAL untuk auto-increment di PostgreSQL
         c.execute(
             """CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
@@ -51,6 +59,7 @@ def init_db():
         logger.info("Database tables initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to connect or initialize database: {e}")
+        raise  # Re-raise exception karena ini kritis
     finally:
         if conn:
             conn.close()
@@ -79,10 +88,6 @@ def is_user(user_id: int) -> bool:
             conn.close()
     return result
 
-# States untuk ConversationHandler
-JUDUL, PENERIMA, DEADLINE, KETERANGAN = range(4)
-task_data = {} # Dictionary sementara untuk menyimpan data tugas selama percakapan
-
 # Owner commands
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menambahkan user ke daftar user yang diizinkan."""
@@ -99,7 +104,6 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = int(context.args[0])
         conn = psycopg2.connect(DATABASE_URL)
         c = conn.cursor()
-        # ON CONFLICT DO NOTHING mencegah error jika user_id sudah ada
         c.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
         conn.commit()
         await update.message.reply_text(f"User {user_id} ditambahkan.")
@@ -173,7 +177,6 @@ async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Maaf, kamu tidak terdaftar sebagai pengguna bot ini. Silakan hubungi pemilik bot.")
         return ConversationHandler.END
     
-    # Inisialisasi data tugas untuk user ini
     task_data[update.effective_user.id] = {}
     await update.message.reply_text("📝 Oke, mari buat tugas baru. Apa judul tugasnya?")
     return JUDUL
@@ -188,15 +191,14 @@ async def input_penerima(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima daftar penerima tugas."""
     recipients_input = update.message.text.strip()
     
-    # Validasi bahwa input adalah ID numerik
     recipient_ids = []
     for r_id_str in recipients_input.split():
         if not r_id_str.isdigit():
             await update.message.reply_text(f"'{r_id_str}' bukan ID numerik yang valid. Mohon masukkan ID numerik Telegram yang dipisahkan spasi.")
-            return PENERIMA # Kembali ke langkah ini jika ada invalid input
+            return PENERIMA
         recipient_ids.append(r_id_str)
 
-    task_data[update.effective_user.id]["recipients"] = " ".join(recipient_ids) # Simpan sebagai string ID dipisahkan spasi
+    task_data[update.effective_user.id]["recipients"] = " ".join(recipient_ids)
     await update.message.reply_text("⏰ Kapan deadline tugas ini? Format: YYYY-MM-DD HH:MM (Contoh: 2025-07-01 15:00)")
     return DEADLINE
 
@@ -207,7 +209,7 @@ async def input_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_data[update.effective_user.id]["deadline"] = deadline
         await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?")
         return KETERANGAN
-    except ValueError: # Tangani ValueError dari strptime jika format salah
+    except ValueError:
         await update.message.reply_text("Format deadline salah. Mohon ikuti format YYYY-MM-DD HH:MM. Contoh: 2025-07-01 15:00")
         return DEADLINE
 
@@ -226,7 +228,7 @@ async def input_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "INSERT INTO tasks (creator_id, title, recipients, deadline, note) VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (uid, d["judul"], d["recipients"], d["deadline"].isoformat(), d["keterangan"]),
         )
-        task_id = c.fetchone()[0] # Dapatkan ID tugas yang baru dibuat
+        task_id = c.fetchone()[0]
         conn.commit()
         logger.info(f"Task #{task_id} created by user {uid}.")
     except Exception as e:
@@ -237,12 +239,9 @@ async def input_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if conn:
             conn.close()
 
-    if task_id: # Hanya kirim notifikasi jika tugas berhasil disimpan
-        # Kirim notifikasi ke penerima
-        # Penting: 'recipients' sekarang diasumsikan berisi ID numerik
+    if task_id:
         for recipient_id_str in d["recipients"].split():
             try:
-                # Mengubah ID string menjadi integer untuk chat_id
                 recipient_chat_id = int(recipient_id_str)
                 await context.bot.send_message(
                     chat_id=recipient_chat_id,
@@ -252,12 +251,11 @@ async def input_keterangan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          f"**Deadline:** {d['deadline'].strftime('%Y-%m-%d %H:%M')}\n"
                          f"**Keterangan:** {d['keterangan']}\n\n"
                          f"Silakan kerjakan. Balas dengan `/done{task_id}` jika selesai.",
-                    parse_mode="Markdown" # Menggunakan Markdown untuk formatting teks
+                    parse_mode="Markdown"
                 )
                 logger.info(f"Notification sent for task #{task_id} to {recipient_chat_id}")
             except Exception as e:
                 logger.warning(f"Gagal kirim notifikasi tugas #{task_id} ke {recipient_id_str}: {e}")
-                # Anda bisa memilih untuk memberi tahu pembuat tugas jika ada penerima yang gagal
         
         await update.message.reply_text(f"✅ Tugas berhasil dibuat dengan ID #{task_id} dan notifikasi dikirimkan.")
     
@@ -267,7 +265,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Membatalkan alur ConversationHandler."""
     user_id = update.effective_user.id
     if user_id in task_data:
-        del task_data[user_id] # Hapus data tugas sementara
+        del task_data[user_id]
     await update.message.reply_text("❌ Pembuatan tugas dibatalkan.")
     return ConversationHandler.END
 
@@ -282,40 +280,76 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Anda belum terdaftar. Mohon hubungi pemilik bot untuk didaftarkan.")
 
+def stop_application():
+    """Cleanup function to stop the application gracefully."""
+    logger.info("Stopping application gracefully...")
+    if app is not None:
+        if app.running:
+            logger.info("Stopping bot application...")
+            app.stop()
+            app.updater.stop()
+    logger.info("Application stopped.")
+
+def signal_handler(signum, frame):
+    """Handle signals for graceful shutdown."""
+    logger.info(f"Received signal {signum}, shutting down...")
+    stop_application()
+    exit(0)
 
 # Main app
 def main():
     """Fungsi utama untuk menjalankan bot."""
-    # Pastikan DATABASE_URL telah diatur sebelum menginisialisasi DB
-    if not DATABASE_URL:
-        logger.critical("DATABASE_URL environment variable is not set. Exiting.")
-        exit(1) # Keluar jika tidak ada DATABASE_URL
-        
-    init_db() # Inisialisasi database saat bot dimulai
+    global app
     
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Pastikan environment variables ada
+    if not all([BOT_TOKEN, OWNER_ID, DATABASE_URL]):
+        logger.critical("Missing required environment variables. Please check BOT_TOKEN, OWNER_ID, and DATABASE_URL.")
+        exit(1)
+        
+    try:
+        init_db()
+    except Exception as e:
+        logger.critical(f"Failed to initialize database: {e}")
+        exit(1)
+    
+    # Setup signal handlers
+    for sig in (SIGINT, SIGTERM, SIGABRT):
+        signal(sig, signal_handler)
+    
+    try:
+        # Build application
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # ConversationHandler untuk alur pembuatan tugas
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("addtask", start_add_task)],
-        states={
-            JUDUL: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_judul)],
-            PENERIMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_penerima)],
-            DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_deadline)],
-            KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_keterangan)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+        # ConversationHandler untuk alur pembuatan tugas
+        conv_handler = ConversationHandler(
+            entry_points=[CommandHandler("addtask", start_add_task)],
+            states={
+                JUDUL: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_judul)],
+                PENERIMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_penerima)],
+                DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_deadline)],
+                KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_keterangan)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
 
-    # Menambahkan semua handler
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler) # Handler untuk alur pembuatan tugas
-    app.add_handler(CommandHandler("adduser", add_user))
-    app.add_handler(CommandHandler("removeuser", remove_user))
-    app.add_handler(CommandHandler("listuser", list_user))
+        # Menambahkan semua handler
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(conv_handler)
+        app.add_handler(CommandHandler("adduser", add_user))
+        app.add_handler(CommandHandler("removeuser", remove_user))
+        app.add_handler(CommandHandler("listuser", list_user))
 
-    logger.info("Bot started polling...")
-    app.run_polling() # Menjalankan bot dalam mode polling
+        logger.info("Bot started polling...")
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False,
+            stop_signals=None,
+            timeout=20
+        )
+    except Exception as e:
+        logger.error(f"Error in main: {e}")
+    finally:
+        stop_application()
 
 if __name__ == "__main__":
     main()
