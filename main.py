@@ -1,131 +1,121 @@
 import os
 import logging
 import threading
-import psycopg2
-from datetime import datetime
-from aiohttp import web
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    ConversationHandler,
+    MessageHandler,
     filters
 )
+from dotenv import load_dotenv
 
-# Konfigurasi Aplikasi
+# Load environment variables
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-PORT = int(os.getenv("PORT", 10000))
 
-# Setup Logging
+# Initialize Flask app
+flask_app = Flask(__name__)
+
+# Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", 10000))
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+
+# Logging setup
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Web Server untuk Health Check
-async def health_check(request):
-    return web.Response(text="Bot Telegram is running")
+# ======================
+# Flask Routes (for Render health checks)
+# ======================
+@flask_app.route('/')
+def health_check():
+    return jsonify({
+        "status": "running",
+        "service": "telegram-bot",
+        "version": "1.0"
+    })
 
-def run_web_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    web.run_app(app, port=PORT)
+@flask_app.route('/status')
+def status():
+    return jsonify({"bot_status": "active"})
 
-# Database Manager
-class DatabaseManager:
-    @staticmethod
-    def get_connection():
-        try:
-            return psycopg2.connect(
-                DATABASE_URL,
-                sslmode="require",
-                connect_timeout=5
-            )
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+def run_flask_app():
+    flask_app.run(host='0.0.0.0', port=PORT)
 
-    @staticmethod
-    def init_db():
-        try:
-            with DatabaseManager.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id BIGINT PRIMARY KEY,
-                            username TEXT,
-                            registered_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS tasks (
-                            id SERIAL PRIMARY KEY,
-                            creator_id BIGINT,
-                            title TEXT,
-                            recipients TEXT,
-                            deadline TIMESTAMP,
-                            note TEXT,
-                            status TEXT DEFAULT 'pending',
-                            created_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """)
-                    conn.commit()
-        except Exception as e:
-            logger.critical(f"Database init failed: {e}")
-            raise
-
-# Command Handlers
+# ======================
+# Telegram Bot Handlers
+# ======================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for /start command"""
     user = update.effective_user
+    await update.message.reply_html(
+        f"👋 Halo <b>{user.first_name}</b>!\n\n"
+        "Saya adalah bot template untuk Render.com\n"
+        "Gunakan /help untuk melihat perintah yang tersedia"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for /help command"""
+    help_text = [
+        "<b>Daftar Perintah:</b>",
+        "/start - Memulai bot",
+        "/help - Menampilkan pesan ini",
+        "/about - Tentang bot ini"
+    ]
+    await update.message.reply_html("\n".join(help_text))
+
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for /about command"""
     await update.message.reply_text(
-        f"Halo {user.first_name}!\n"
-        "Gunakan /addtask untuk membuat tugas baru"
+        "🤖 Bot Template\n"
+        "Dibuat untuk deploy di Render.com\n"
+        "Dengan Python Telegram Bot + Flask"
     )
 
-async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_user(update.effective_user.id):
-        await update.message.reply_text("Anda tidak terdaftar!")
-        return
-    
-    await update.message.reply_text("Masukkan judul tugas:")
-    return "GET_TITLE"
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Echo user message"""
+    await update.message.reply_text(update.message.text)
 
-# [Tambahkan lebih banyak handler sesuai kebutuhan...]
+# ======================
+# Bot Initialization
+# ======================
+def setup_bot():
+    """Configure and return Telegram bot application"""
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("about", about))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    return application
+
+# ======================
+# Main Application
+# ======================
 def main():
-    # Jalankan web server di thread terpisah
-    web_thread = threading.Thread(target=run_web_server, daemon=True)
-    web_thread.start()
+    """Main application entry point"""
+    try:
+        # Start Flask server in a separate thread
+        flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+        flask_thread.start()
 
-    # Inisialisasi database
-    DatabaseManager.init_db()
+        # Initialize and run Telegram bot
+        bot_app = setup_bot()
+        
+        logger.info("Starting bot in polling mode...")
+        bot_app.run_polling()
 
-    # Setup bot Telegram
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # Registrasi handler
-    app.add_handler(CommandHandler("start", start))
-    
-    # Conversation handler untuk membuat task
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("addtask", add_task)],
-        states={
-            "GET_TITLE": [MessageHandler(filters.TEXT, get_title)],
-            "GET_DESC": [MessageHandler(filters.TEXT, get_description)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)]
-    )
-    app.add_handler(conv_handler)
-
-    # Mulai bot
-    logger.info("Bot starting...")
-    app.run_polling()
+    except Exception as e:
+        logger.critical(f"Application failed: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
