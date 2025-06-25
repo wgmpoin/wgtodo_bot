@@ -2,10 +2,9 @@ import os
 import logging
 import threading
 import psycopg2
-import time # Untuk sleep di background thread
-from datetime import datetime, timedelta # Untuk perhitungan deadline
-from flask import Flask
-from telegram import Update
+from datetime import datetime, timedelta
+from flask import Flask, request
+from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -21,663 +20,448 @@ from dotenv import load_dotenv
 # ======================================
 load_dotenv()
 
+# Konfigurasi logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
 # Konfigurasi variabel lingkungan
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
-REMINDER_INTERVAL_SECONDS = 3600 # Cek reminder setiap 1 jam
+REMINDER_INTERVAL_SECONDS = 3600  # Cek reminder setiap 1 jam
+
+# Tambahkan baris ini untuk DATABASE_URL
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Validasi variabel penting
 if not BOT_TOKEN:
     logger.critical("BOT_TOKEN environment variable must be set! Exiting.")
     exit(1)
+if not DATABASE_URL:
+    logger.critical("DATABASE_URL environment variable must be set! Exiting.")
+    exit(1)
 if OWNER_ID == 0:
     logger.warning("OWNER_ID not set, admin commands will be disabled.")
 
-# Flask app untuk Render health checks
-flask_app = Flask(__name__)
-@flask_app.route('/')
-def health_check():
-    return "Bot is running 🚀 | Owner ID: {}".format(OWNER_ID)
-
-# Konfigurasi Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Global variable for bot application instance (needed for reminder thread)
-bot_application = None
-
 # ======================================
-# DATABASE MANAGER (PostgreSQL)
-# ======================================
-class DatabaseManager:
-    @staticmethod
-    def get_connection():
-        """Mendapatkan koneksi ke database PostgreSQL."""
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL environment variable is not set.")
-        try:
-            return psycopg2.connect(
-                DATABASE_URL,
-                sslmode="require",
-                connect_timeout=10 # Timeout koneksi 10 detik
-            )
-        except Exception as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
-
-    @staticmethod
-    def init_db():
-        """Menginisialisasi tabel database jika belum ada."""
-        try:
-            with DatabaseManager.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id BIGINT PRIMARY KEY,
-                            username TEXT,
-                            registered_at TIMESTAMP DEFAULT NOW()
-                        )
-                    """)
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS tasks (
-                            id SERIAL PRIMARY KEY,
-                            creator_id BIGINT,
-                            title TEXT,
-                            recipients TEXT, -- Simpan ID penerima dipisahkan spasi
-                            deadline TIMESTAMP,
-                            note TEXT,
-                            status TEXT DEFAULT 'pending', -- 'pending', 'completed', 'cancelled'
-                            created_at TIMESTAMP DEFAULT NOW(),
-                            last_reminded_at TIMESTAMP -- Kapan terakhir diingatkan
-                        )
-                    """)
-                    conn.commit()
-            logger.info("Database tables initialized successfully.")
-        except Exception as e:
-            logger.critical(f"Database initialization failed: {e}")
-            raise
-
-# ======================================
-# BOT HANDLERS
+# DATABASE FUNCTIONS
 # ======================================
 
-# Authorization Helper
-def is_owner(user_id: int) -> bool:
-    """Memeriksa apakah user adalah OWNER_ID."""
-    return user_id == OWNER_ID
-
-async def is_user_registered(user_id: int) -> bool:
-    """Memeriksa apakah user terdaftar di database."""
-    if user_id == OWNER_ID: # Owner selalu dianggap terdaftar
-        return True
-    
-    conn = None
+def get_db_connection():
+    """Membuka koneksi database."""
     try:
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
-            return cur.fetchone() is not None
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+        return conn
     except Exception as e:
-        logger.error(f"Error checking if user {user_id} is registered: {e}")
-        return False
-    finally:
-        if conn:
-            conn.close()
+        logger.error(f"Error connecting to database: {e}")
+        return None
 
-# ADMIN COMMANDS
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menambahkan user ke daftar user yang diizinkan (hanya owner)."""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Maaf, hanya pemilik bot yang bisa menggunakan perintah ini.")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("⚠️ Format: `/adduser [ID_TELEGRAM_NUMERIK]`")
-        return
-    
-    conn = None
-    try:
-        user_id_to_add = int(context.args[0])
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO users (user_id, username) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING",
-                (user_id_to_add, update.effective_user.username or "N/A")
-            )
+def init_db():
+    """Menginisialisasi tabel database jika belum ada."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS reminders (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    reminder_text TEXT NOT NULL,
+                    remind_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
             conn.commit()
-        await update.message.reply_text(f"✅ User `{user_id_to_add}` berhasil ditambahkan!")
-        logger.info(f"User {user_id_to_add} added by owner {update.effective_user.id}.")
-    except ValueError:
-        await update.message.reply_text("⚠️ ID user tidak valid. Mohon masukkan angka.")
-    except Exception as e:
-        logger.error(f"Error adding user {context.args[0]} by {update.effective_user.id}: {e}")
-        await update.message.reply_text("❌ Gagal menambahkan user. Cek log untuk detail.")
-    finally:
-        if conn:
+            logger.info("Database table 'reminders' checked/created successfully.")
+        except Exception as e:
+            logger.error(f"Error initializing database: {e}")
+        finally:
+            cur.close()
             conn.close()
+    else:
+        logger.error("Could not get database connection for initialization.")
 
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan daftar user yang terdaftar (hanya owner)."""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Maaf, hanya pemilik bot yang bisa menggunakan perintah ini.")
-        return
-    
-    conn = None
-    try:
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT user_id, username FROM users")
-            users = cur.fetchall()
-        
-        if users:
-            msg = "📋 User terdaftar:\n" + "\n".join([f"👤 `{uid}` (@{uname})" if uname != "N/A" else f"👤 `{uid}`" for uid, uname in users])
-        else:
-            msg = "📭 Tidak ada user terdaftar."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error listing users by {update.effective_user.id}: {e}")
-        await update.message.reply_text("❌ Gagal menampilkan user. Cek log untuk detail.")
-    finally:
-        if conn:
-            conn.close()
+# Panggil inisialisasi DB saat aplikasi dimulai
+init_db()
 
-# TASK MANAGEMENT (Conversation Handler)
-TASK_TITLE, TASK_RECIPIENTS, TASK_DEADLINE, TASK_NOTE = range(4)
+# ======================================
+# BOT STATES
+# ======================================
+SET_REMINDER_TEXT, SET_REMINDER_TIME = range(2)
 
-async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Memulai alur pembuatan tugas."""
-    if not await is_user_registered(update.effective_user.id):
-        await update.message.reply_text("🔐 Anda belum terdaftar sebagai pengguna bot ini. Silakan hubungi pemilik bot.")
-        return ConversationHandler.END
-    
-    context.user_data['task_data'] = {}
-    await update.message.reply_text("📝 Oke, mari buat tugas baru. Apa judul tugasnya?")
-    return TASK_TITLE
+# ======================================
+# BOT COMMAND HANDLERS
+# ======================================
 
-async def get_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima judul tugas."""
-    context.user_data['task_data']['title'] = update.message.text.strip()
-    await update.message.reply_text("👥 Siapa penerima tugas ini? (Mohon gunakan ID numerik Telegram mereka, pisahkan dengan spasi jika lebih dari satu. Contoh: `123456789 987654321`)\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-    return TASK_RECIPIENTS
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menanggapi perintah /start."""
+    user = update.effective_user
+    await update.message.reply_html(
+        f"Halo {user.mention_html()}! Saya adalah bot pengingat. "
+        "Anda bisa menyuruh saya untuk mengingatkan Anda tentang sesuatu."
+    )
 
-async def get_task_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima daftar penerima tugas dan memvalidasinya."""
-    recipients_input = update.message.text.strip()
-    
-    recipient_ids = []
-    # Memastikan semua ID adalah numerik
-    for r_id_str in recipients_input.split():
-        if not r_id_str.isdigit():
-            await update.message.reply_text(f"⚠️ `{r_id_str}` bukan ID numerik yang valid. Mohon masukkan ID numerik Telegram yang dipisahkan spasi.\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-            return TASK_RECIPIENTS
-        recipient_ids.append(r_id_str)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menanggapi perintah /help."""
+    help_text = (
+        "Berikut adalah perintah yang bisa Anda gunakan:\n"
+        "/start - Memulai bot\n"
+        "/help - Menampilkan pesan bantuan ini\n"
+        "/setreminder - Menyetel pengingat baru\n"
+        "/myreminders - Menampilkan semua pengingat Anda\n"
+        "/cancel - Membatalkan proses penyetelan pengingat"
+    )
+    await update.message.reply_text(help_text)
 
-    context.user_data['task_data']['recipients'] = " ".join(recipient_ids)
-    await update.message.reply_text("⏰ Kapan deadline tugas ini? Format: `YYYY-MM-DD HH:MM` (Contoh: `2025-07-01 15:00`)\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-    return TASK_DEADLINE
+async def set_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Memulai alur penyetelan pengingat."""
+    await update.message.reply_text(
+        "Oke, saya akan membantu Anda menyetel pengingat. "
+        "Apa yang ingin Anda ingatkan? (Misal: 'beli susu', 'rapat jam 10 pagi')"
+    )
+    return SET_REMINDER_TEXT
 
-async def get_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima deadline tugas dan memvalidasinya."""
-    try:
-        deadline_str = update.message.text.strip()
-        deadline_dt = datetime.strptime(deadline_str, "%Y-%m-%d %H:%M")
-        
-        if deadline_dt < datetime.now():
-            await update.message.reply_text("⚠️ Deadline tidak bisa di masa lalu. Mohon masukkan tanggal dan waktu di masa depan.\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-            return TASK_DEADLINE
+async def receive_reminder_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Menerima teks pengingat dari pengguna."""
+    context.user_data['reminder_text'] = update.message.text
+    await update.message.reply_text(
+        f"Baik, saya akan mengingatkan Anda tentang '{context.user_data['reminder_text']}'.\n"
+        "Kapan Anda ingin diingatkan? (Misal: 'besok jam 9 pagi', '2 jam lagi', '2025-12-31 23:59')"
+    )
+    return SET_REMINDER_TIME
 
-        context.user_data['task_data']['deadline'] = deadline_dt
-        await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?\n\nKetik `/cancel` untuk membatalkan.")
-        return TASK_NOTE
-    except ValueError:
-        await update.message.reply_text("⚠️ Format deadline salah. Mohon ikuti format `YYYY-MM-DD HH:MM`. Contoh: `2025-07-01 15:00`\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-        return TASK_DEADLINE
-
-async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menerima keterangan tugas, menyimpan ke DB, dan mengirim notifikasi."""
+async def receive_reminder_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Menerima waktu pengingat dan menyimpannya ke database."""
+    user_input_time = update.message.text
+    reminder_text = context.user_data.get('reminder_text')
     user_id = update.effective_user.id
-    task_data_temp = context.user_data.get('task_data')
-    
-    if not task_data_temp:
-        await update.message.reply_text("❌ Maaf, data pembuatan tugas hilang. Mohon mulai ulang dengan /addtask.")
+    chat_id = update.effective_chat.id
+
+    if not reminder_text:
+        await update.message.reply_text(
+            "Maaf, saya tidak menemukan teks pengingat. "
+            "Silakan mulai lagi dengan /setreminder."
+        )
         return ConversationHandler.END
 
-    task_data_temp['note'] = update.message.text.strip()
-
-    conn = None
-    task_id = None
     try:
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO tasks (creator_id, title, recipients, deadline, note) 
-                   VALUES (%s, %s, %s, %s, %s) RETURNING id""",
-                (user_id, 
-                 task_data_temp['title'], 
-                 task_data_temp['recipients'], 
-                 task_data_temp['deadline'], 
-                 task_data_temp['note']),
-            )
-            task_id = cur.fetchone()[0]
-            conn.commit()
-        logger.info(f"Task #{task_id} created by user {user_id}.")
-    except Exception as e:
-        logger.error(f"Error saving task for user {user_id}: {e}")
-        await update.message.reply_text("❌ Gagal membuat tugas. Mohon coba lagi nanti atau hubungi admin.")
-        return ConversationHandler.END
-    finally:
-        if conn:
-            conn.close()
+        # Coba parse waktu relatif (misal: "2 jam lagi", "besok")
+        remind_at = parse_relative_time(user_input_time)
+        if not remind_at:
+            # Coba parse waktu absolut (misal: "2025-12-31 23:59", "besok jam 9 pagi")
+            remind_at = parse_absolute_time(user_input_time)
 
-    if task_id:
-        recipients_list = task_data_temp['recipients'].split()
-        for recipient_id_str in recipients_list:
+        if not remind_at:
+            await update.message.reply_text(
+                "Maaf, saya tidak bisa memahami waktu yang Anda berikan. "
+                "Coba format seperti 'besok jam 9 pagi' atau '2 jam lagi' atau '2025-12-31 23:59'."
+            )
+            return SET_REMINDER_TIME # Tetap di state ini untuk mencoba lagi
+
+        conn = get_db_connection()
+        if conn:
             try:
-                recipient_chat_id = int(recipient_id_str)
-                await context.bot.send_message(
-                    chat_id=recipient_chat_id,
-                    text=f"📋 **Tugas Baru!**\n\n"
-                         f"**ID Tugas:** `#{task_id}`\n"
-                         f"**Judul:** {task_data_temp['title']}\n"
-                         f"**Deadline:** {task_data_temp['deadline'].strftime('%Y-%m-%d %H:%M')}\n"
-                         f"**Keterangan:** {task_data_temp['note']}\n\n"
-                         f"Silakan kerjakan. Balas dengan `/done{task_id}` jika selesai.",
-                    parse_mode="Markdown"
-                )
-                logger.info(f"Notification sent for task #{task_id} to {recipient_chat_id}")
-            except Exception as e:
-                logger.warning(f"Gagal kirim notifikasi tugas #{task_id} ke {recipient_id_str}: {e}")
-        
-        await update.message.reply_text(f"✅ Tugas berhasil dibuat dengan ID `#{task_id}` dan notifikasi dikirimkan.")
-    
-    if 'task_data' in context.user_data:
-        del context.user_data['task_data']
-    
-    return ConversationHandler.END
-
-async def cancel_task_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Membatalkan alur ConversationHandler pembuatan tugas."""
-    if 'task_data' in context.user_data:
-        del context.user_data['task_data']
-    await update.message.reply_text("❌ Pembuatan tugas dibatalkan.")
-    return ConversationHandler.END
-
-async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menandai tugas sebagai selesai berdasarkan ID tugas."""
-    user_id = update.effective_user.id
-    if not await is_user_registered(user_id):
-        await update.message.reply_text("🔐 Anda belum terdaftar!")
-        return
-
-    # Perintah /doneXYZ, ambil XYZ
-    if not context.args and not update.message.text.startswith('/done'):
-        await update.message.reply_text("⚠️ Format: `/done[ID_TUGAS]` (contoh: `/done123`)\nAtau ketik `/done` lalu ID tugas.", parse_mode="Markdown")
-        return
-    
-    task_id_str = None
-    if context.args: # Jika format /done ID
-        task_id_str = context.args[0]
-    elif update.message.text.startswith('/done'): # Jika format /doneID
-        task_id_str = update.message.text[5:] # Ambil setelah '/done'
-
-    if not task_id_str or not task_id_str.isdigit():
-        await update.message.reply_text("⚠️ ID tugas tidak valid. Mohon masukkan angka.")
-        return
-
-    task_id = int(task_id_str)
-    conn = None
-    try:
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            # Periksa apakah user adalah penerima tugas atau pembuat tugas
-            cur.execute(
-                "SELECT creator_id, recipients, title, status FROM tasks WHERE id = %s",
-                (task_id,)
-            )
-            task_info = cur.fetchone()
-
-            if not task_info:
-                await update.message.reply_text(f"❌ Tugas dengan ID `{task_id}` tidak ditemukan.", parse_mode="Markdown")
-                return
-
-            creator_id, recipients_str, title, current_status = task_info
-            recipients_list = recipients_str.split()
-
-            if current_status == 'completed':
-                await update.message.reply_text(f"✅ Tugas `{title}` (ID: `{task_id}`) sudah selesai sebelumnya.", parse_mode="Markdown")
-                return
-            if current_status == 'cancelled':
-                await update.message.reply_text(f"🚫 Tugas `{title}` (ID: `{task_id}`) telah dibatalkan.", parse_mode="Markdown")
-                return
-
-            # Hanya penerima atau pembuat yang bisa menandai selesai
-            if str(user_id) in recipients_list or user_id == creator_id:
+                cur = conn.cursor()
                 cur.execute(
-                    "UPDATE tasks SET status = 'completed' WHERE id = %s",
-                    (task_id,)
+                    "INSERT INTO reminders (user_id, chat_id, reminder_text, remind_at) VALUES (%s, %s, %s, %s)",
+                    (user_id, chat_id, reminder_text, remind_at)
                 )
                 conn.commit()
-                await update.message.reply_text(f"✅ Tugas `{title}` (ID: `{task_id}`) berhasil ditandai sebagai selesai!", parse_mode="Markdown")
-                logger.info(f"Task #{task_id} marked completed by user {user_id}.")
-
-                # Kirim notifikasi ke pembuat tugas
-                if user_id != creator_id: # Hindari duplikasi notif jika pembuat sendiri yang done
-                    try:
-                        await context.bot.send_message(
-                            chat_id=creator_id,
-                            text=f"🎉 **Pemberitahuan:**\n\n"
-                                 f"Tugas Anda: `{title}` (ID: `{task_id}`)\n"
-                                 f"Telah ditandai selesai oleh `{update.effective_user.id}`.",
-                            parse_mode="Markdown"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to notify creator {creator_id} for task {task_id} completion: {e}")
-            else:
-                await update.message.reply_text("❌ Anda tidak memiliki izin untuk menandai tugas ini sebagai selesai.")
-
-    except Exception as e:
-        logger.error(f"Error marking task {task_id} as done by {user_id}: {e}")
-        await update.message.reply_text("❌ Terjadi kesalahan saat memproses permintaan Anda. Cek log untuk detail.")
-    finally:
-        if conn:
-            conn.close()
-
-async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan daftar tugas berdasarkan status."""
-    user_id = update.effective_user.id
-    if not await is_user_registered(user_id):
-        await update.message.reply_text("🔐 Anda belum terdaftar!")
-        return
-
-    conn = None
-    try:
-        conn = DatabaseManager.get_connection()
-        with conn.cursor() as cur:
-            # Mengambil tugas di mana user adalah creator atau recipient
-            cur.execute(
-                """SELECT id, title, recipients, deadline, note, status, creator_id
-                   FROM tasks
-                   WHERE creator_id = %s OR recipients LIKE %s
-                   ORDER BY deadline ASC, status ASC""",
-                (user_id, f'%{user_id}%') # Mencari ID user di kolom recipients
-            )
-            tasks = cur.fetchall()
-
-        if not tasks:
-            await update.message.reply_text("📭 Tidak ada tugas yang terkait dengan Anda.")
-            return
-
-        response_msg = "📋 **Daftar Tugas Anda:**\n\n"
-        pending_tasks = []
-        completed_tasks = []
-        cancelled_tasks = []
-
-        for task_id, title, recipients, deadline, note, status, creator_id in tasks:
-            recipients_ids = recipients.split()
-            is_creator = (user_id == creator_id)
-            is_recipient = (str(user_id) in recipients_ids) # recipients_ids adalah list string
-
-            # Tentukan label status
-            status_label = ""
-            if status == 'pending':
-                status_label = "⏳ _(Pending)_"
-            elif status == 'completed':
-                status_label = "✅ _(Selesai)_"
-            elif status == 'cancelled':
-                status_label = "🚫 _(Dibatalkan)_"
-
-            # Tentukan peran user dalam tugas ini
-            role_label = ""
-            if is_creator:
-                role_label += "Pembuat"
-            if is_recipient:
-                if role_label: role_label += "/"
-                role_label += "Penerima"
-
-            task_details = (
-                f"**ID:** `{task_id}` {status_label}\n"
-                f"**Judul:** {title}\n"
-                f"**Deadline:** {deadline.strftime('%Y-%m-%d %H:%M')}\n"
-                f"**Note:** {note}\n"
-                f"**Peran Anda:** {role_label}\n"
-            )
-            
-            if status == 'pending':
-                pending_tasks.append(task_details)
-            elif status == 'completed':
-                completed_tasks.append(task_details)
-            elif status == 'cancelled':
-                cancelled_tasks.append(task_details)
-
-        if pending_tasks:
-            response_msg += "*Tugas Menunggu:*\n" + ("\n---\n".join(pending_tasks)) + "\n\n"
-        if completed_tasks:
-            response_msg += "*Tugas Selesai:*\n" + ("\n---\n".join(completed_tasks)) + "\n\n"
-        if cancelled_tasks:
-            response_msg += "*Tugas Dibatalkan:*\n" + ("\n---\n".join(cancelled_tasks)) + "\n\n"
-        
-        await update.message.reply_text(response_msg, parse_mode="Markdown")
-
-    except Exception as e:
-        logger.error(f"Error listing tasks for user {user_id}: {e}")
-        await update.message.reply_text("❌ Terjadi kesalahan saat menampilkan daftar tugas. Cek log untuk detail.")
-    finally:
-        if conn:
-            conn.close()
-
-# BASIC COMMANDS
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mengirim pesan selamat datang dan daftar perintah."""
-    user = update.effective_user
-    commands = [
-        "/start - Tampilkan pesan ini",
-        "/addtask - Buat tugas baru",
-        "/listtasks - Lihat daftar tugas Anda",
-        "/done[ID] - Tandai tugas selesai (contoh: /done123)",
-        "/cancel - Batalkan pembuatan tugas",
-        "/help - Tampilkan bantuan"
-    ]
-    
-    if is_owner(user.id):
-        commands.extend([
-            "/adduser [ID] - Tambah user baru",
-            "/listusers - Lihat daftar user terdaftar"
-        ])
-    
-    await update.message.reply_text(
-        f"👋 Halo {user.first_name}!\n\n"
-        "📌 Perintah yang tersedia:\n" + 
-        "\n".join(commands),
-        parse_mode="Markdown"
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menampilkan pesan bantuan (sama dengan start untuk saat ini)."""
-    await start(update, context)
-
-# ======================================
-# REMINDER FEATURE (Background Thread)
-# ======================================
-async def send_reminder(chat_id: int, task_id: int, title: str, deadline: datetime, reminder_type: str):
-    """Mengirim pesan pengingat ke user."""
-    if bot_application: # Pastikan bot_application sudah terinisialisasi
-        try:
-            await bot_application.bot.send_message(
-                chat_id=chat_id,
-                text=f"🔔 **Pengingat Tugas!**\n\n"
-                     f"**ID Tugas:** `#{task_id}`\n"
-                     f"**Judul:** {title}\n"
-                     f"**Deadline:** {deadline.strftime('%Y-%m-%d %H:%M')}\n"
-                     f"**Status:** {reminder_type} lagi menuju deadline!\n\n"
-                     f"Segera selesaikan atau tandai dengan `/done{task_id}`.",
-                parse_mode="Markdown"
-            )
-            logger.info(f"Reminder ({reminder_type}) sent for task #{task_id} to {chat_id}")
-        except Exception as e:
-            logger.warning(f"Failed to send reminder for task #{task_id} to {chat_id}: {e}")
-
-def reminder_worker(app: ApplicationBuilder):
-    """Fungsi worker yang berjalan di background untuk mengecek reminder."""
-    global bot_application # Akses global bot_application
-    bot_application = app # Set global reference to the application
-
-    while True:
-        conn = None
-        try:
-            conn = DatabaseManager.get_connection()
-            with conn.cursor() as cur:
-                # Ambil semua tugas yang pending dan memiliki deadline di masa depan
-                # Serta belum diingatkan dalam REMINDER_INTERVAL_SECONDS terakhir
-                cur.execute(
-                    """SELECT id, creator_id, title, recipients, deadline, last_reminded_at
-                       FROM tasks
-                       WHERE status = 'pending' AND deadline > NOW()
-                       AND (last_reminded_at IS NULL OR last_reminded_at < NOW() - INTERVAL '%s seconds')""",
-                    (REMINDER_INTERVAL_SECONDS,)
+                await update.message.reply_text(
+                    f"Pengingat disetel untuk '{reminder_text}' pada "
+                    f"{remind_at.strftime('%Y-%m-%d %H:%M:%S %Z%z')}."
                 )
-                tasks_to_check = cur.fetchall()
-
-            current_time = datetime.now()
-            
-            for task_id, creator_id, title, recipients_str, deadline, last_reminded_at in tasks_to_check:
-                time_left = deadline - current_time
-                recipients_list = recipients_str.split()
-                
-                reminder_needed = False
-                reminder_type = ""
-
-                # Reminder 7 hari
-                if timedelta(days=6, hours=23) < time_left <= timedelta(days=7, hours=23):
-                    reminder_needed = True
-                    reminder_type = "7 Hari"
-                # Reminder 3 hari
-                elif timedelta(days=2, hours=23) < time_left <= timedelta(days=3, hours=23):
-                    reminder_needed = True
-                    reminder_type = "3 Hari"
-                # Reminder 2 hari
-                elif timedelta(days=1, hours=23) < time_left <= timedelta(days=2, hours=23):
-                    reminder_needed = True
-                    reminder_type = "2 Hari"
-                # Reminder 1 hari (24 jam)
-                elif timedelta(hours=23) < time_left <= timedelta(days=1, hours=23):
-                    reminder_needed = True
-                    reminder_type = "1 Hari"
-                # Reminder 1 jam
-                elif timedelta(minutes=59) < time_left <= timedelta(hours=1, minutes=1): # Sedikit buffer
-                    reminder_needed = True
-                    reminder_type = "1 Jam"
-                # Reminder sudah lewat
-                elif time_left <= timedelta(minutes=0) and time_left > timedelta(minutes=-10): # Baru saja lewat
-                     reminder_needed = True
-                     reminder_type = "Telah Lewat"
-
-
-                if reminder_needed:
-                    # Kirim reminder ke setiap penerima dan pembuat
-                    all_involved_users = set([creator_id] + [int(r) for r in recipients_list])
-                    for user_chat_id in all_involved_users:
-                        # Schedule the async send_reminder call using application.create_task
-                        # This runs the async function in the bot's event loop
-                        app.create_task(send_reminder(user_chat_id, task_id, title, deadline, reminder_type))
-                    
-                    # Update last_reminded_at di database
-                    with conn.cursor() as update_cur:
-                        update_cur.execute(
-                            "UPDATE tasks SET last_reminded_at = %s WHERE id = %s",
-                            (current_time, task_id)
-                        )
-                        conn.commit()
-                    logger.info(f"Task #{task_id} reminder processed for '{reminder_type}'.")
-        
-        except Exception as e:
-            logger.error(f"Error in reminder worker: {e}")
-        finally:
-            if conn:
+            except Exception as e:
+                logger.error(f"Error saving reminder to DB: {e}")
+                await update.message.reply_text(
+                    "Maaf, ada masalah saat menyimpan pengingat Anda."
+                )
+            finally:
+                cur.close()
                 conn.close()
-        
-        time.sleep(REMINDER_INTERVAL_SECONDS) # Tunggu sebelum cek lagi
+        else:
+            await update.message.reply_text(
+                "Maaf, saya tidak bisa terhubung ke database saat ini."
+            )
 
-# ======================================
-# BOT SETUP
-# ======================================
-def setup_bot():
-    """Mengkonfigurasi bot Telegram."""
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    except Exception as e:
+        logger.error(f"Error parsing time or saving reminder: {e}")
+        await update.message.reply_text(
+            "Terjadi kesalahan. Pastikan format waktu Anda benar."
+        )
 
-    # Admin commands
-    app.add_handler(CommandHandler("adduser", add_user))
-    app.add_handler(CommandHandler("listusers", list_users))
+    context.user_data.clear() # Bersihkan data pengguna setelah selesai
+    return ConversationHandler.END
 
-    # Task management ConversationHandler
-    task_conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("addtask", start_add_task)],
-        states={
-            TASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_title)],
-            TASK_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_recipients)],
-            TASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_deadline)],
-            TASK_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task_and_notify)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_task_creation)],
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Membatalkan alur penyetelan pengingat."""
+    await update.message.reply_text(
+        "Proses penyetelan pengingat dibatalkan."
     )
-    app.add_handler(task_conv_handler)
-    
-    # Task actions
-    app.add_handler(CommandHandler("done", done_task)) # Handle /done 123
-    app.add_handler(MessageHandler(filters.Regex(r'^/done\d+$'), done_task)) # Handle /done123
-    app.add_handler(CommandHandler("listtasks", list_tasks))
+    context.user_data.clear()
+    return ConversationHandler.END
 
-    # Basic commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
+async def my_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Menampilkan semua pengingat yang akan datang untuk pengguna."""
+    user_id = update.effective_user.id
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            now = datetime.now(remind_at.tzinfo if remind_at else None) # Gunakan timezone dari remind_at jika ada, atau UTC
+            cur.execute(
+                "SELECT id, reminder_text, remind_at FROM reminders WHERE user_id = %s AND remind_at > %s ORDER BY remind_at ASC",
+                (user_id, now)
+            )
+            reminders = cur.fetchall()
 
-    return app
+            if reminders:
+                response_text = "Pengingat Anda yang akan datang:\n"
+                for r_id, text, remind_at in reminders:
+                    response_text += (
+                        f"- ID: {r_id}, '{text}' pada "
+                        f"{remind_at.strftime('%Y-%m-%d %H:%M:%S %Z%z')}\n"
+                    )
+                await update.message.reply_text(response_text)
+            else:
+                await update.message.reply_text("Anda tidak memiliki pengingat yang akan datang.")
+        except Exception as e:
+            logger.error(f"Error fetching reminders from DB: {e}")
+            await update.message.reply_text(
+                "Maaf, ada masalah saat mengambil pengingat Anda."
+            )
+        finally:
+            cur.close()
+            conn.close()
+    else:
+        await update.message.reply_text(
+            "Maaf, saya tidak bisa terhubung ke database saat ini."
+        )
 
 # ======================================
-# MAIN APPLICATION
+# TIME PARSING UTILITIES
 # ======================================
-def run_flask_server():
-    """Menjalankan Flask web server di thread terpisah."""
-    logger.info(f"Starting Flask health check server on port {PORT}...")
-    try:
-        flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-    except Exception as e:
-        logger.critical(f"Flask server failed to start: {e}")
-        os._exit(1) # Keluar dari proses jika Flask gagal
 
-def main():
-    """Fungsi utama aplikasi."""
-    if not BOT_TOKEN or not DATABASE_URL:
-        logger.critical("Critical environment variables (BOT_TOKEN, DATABASE_URL) are not set. Exiting.")
-        exit(1)
+def parse_relative_time(text: str) -> datetime | None:
+    """Mencoba mengurai waktu relatif seperti '2 jam lagi', '30 menit lagi'."""
+    now = datetime.now()
+    text_lower = text.lower()
 
-    # Start Flask in background thread
-    web_thread = threading.Thread(target=run_flask_server, daemon=True)
-    web_thread.start()
-    
-    # Inisialisasi database
-    try:
-        DatabaseManager.init_db()
-    except Exception:
-        logger.critical("Database initialization failed. Exiting application.")
-        exit(1)
+    if "menit lagi" in text_lower:
+        try:
+            minutes = int(text_lower.split(" ")[0])
+            return now + timedelta(minutes=minutes)
+        except ValueError:
+            pass
+    elif "jam lagi" in text_lower:
+        try:
+            hours = int(text_lower.split(" ")[0])
+            return now + timedelta(hours=hours)
+        except ValueError:
+            pass
+    elif "hari lagi" in text_lower:
+        try:
+            days = int(text_lower.split(" ")[0])
+            return now + timedelta(days=days)
+        except ValueError:
+            pass
+    elif "besok" in text_lower:
+        # Jika hanya 'besok', set ke besok jam 9 pagi sebagai default
+        if "jam" not in text_lower:
+            return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        # Jika ada 'besok jam X', parse jamnya
+        try:
+            parts = text_lower.split("jam")
+            hour_str = parts[1].strip().split(" ")[0]
+            hour = int(hour_str)
+            return (now + timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+        except (ValueError, IndexError):
+            pass
+    return None
 
-    # Setup dan jalankan bot
-    bot_app = setup_bot()
-    
-    # Start reminder worker in a separate thread
-    reminder_thread = threading.Thread(target=reminder_worker, args=(bot_app,), daemon=True)
-    reminder_thread.start()
-    
-    logger.info("Starting Telegram bot in polling mode...")
+def parse_absolute_time(text: str) -> datetime | None:
+    """Mencoba mengurai waktu absolut seperti '2025-12-31 23:59', 'besok jam 9 pagi'."""
+    now = datetime.now()
+    text_lower = text.lower()
+
+    # Format YYYY-MM-DD HH:MM
     try:
-        bot_app.run_polling(poll_interval=3, timeout=30)
-    except Exception as e:
-        logger.critical(f"Telegram bot polling failed: {e}")
-        raise
+        return datetime.strptime(text, "%Y-%m-%d %H:%M")
+    except ValueError:
+        pass
+    # Format YYYY-MM-DD HH:MM:SS
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        pass
+
+    # Format 'besok jam X pagi/sore'
+    if "besok jam" in text_lower:
+        try:
+            parts = text_lower.split("jam")
+            time_part = parts[1].strip()
+            hour = int(time_part.split(" ")[0])
+            if "pagi" in time_part and hour == 12: # Handle 12 pagi (midnight)
+                hour = 0
+            elif "sore" in time_part and hour < 12: # Handle PM
+                hour += 12
+            
+            # Jika user tidak menyebutkan 'pagi' atau 'sore', asumsikan AM/PM berdasarkan waktu saat ini
+            # Jika waktu yang diinput sudah lewat hari ini, asumsikan besok
+            target_time = (now + timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+            return target_time
+        except (ValueError, IndexError):
+            pass
+    
+    # Format 'jam X pagi/sore' (untuk hari ini atau besok)
+    if "jam" in text_lower:
+        try:
+            parts = text_lower.split("jam")
+            time_part = parts[1].strip()
+            hour = int(time_part.split(" ")[0])
+            
+            is_am = "pagi" in time_part
+            is_pm = "sore" in time_part or "malam" in time_part
+
+            if is_pm and hour < 12:
+                hour += 12
+            elif is_am and hour == 12: # 12 pagi adalah tengah malam
+                hour = 0
+            
+            target_datetime = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+            # Jika waktu yang diinput sudah lewat hari ini, setel untuk besok
+            if target_datetime <= now and not (is_am or is_pm): # Jika tidak ada AM/PM, dan waktu sudah lewat
+                # Coba asumsikan PM jika waktu sekarang AM dan waktu input AM
+                if now.hour < 12 and hour < 12:
+                    target_datetime = now.replace(hour=hour + 12, minute=0, second=0, microsecond=0)
+                    if target_datetime <= now: # Jika masih lewat, berarti besok
+                        target_datetime += timedelta(days=1)
+                else: # Jika waktu sekarang sudah PM atau waktu input sudah PM, langsung besok
+                    target_datetime += timedelta(days=1)
+            elif target_datetime <= now and (is_am or is_pm): # Jika ada AM/PM, dan waktu sudah lewat
+                target_datetime += timedelta(days=1) # Langsung setel untuk besok
+            
+            return target_datetime
+        except (ValueError, IndexError):
+            pass
+
+    return None
+
+
+# ======================================
+# REMINDER CHECKER
+# ======================================
+
+async def check_reminders(application: ApplicationBuilder) -> None:
+    """Fungsi yang berjalan secara periodik untuk memeriksa pengingat."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            now = datetime.now()
+            # Ambil pengingat yang sudah waktunya dan belum dikirim
+            cur.execute(
+                "SELECT id, user_id, chat_id, reminder_text, remind_at FROM reminders WHERE remind_at <= %s ORDER BY remind_at ASC",
+                (now,)
+            )
+            reminders_to_send = cur.fetchall()
+
+            bot = application.bot
+            for r_id, user_id, chat_id, text, remind_at in reminders_to_send:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🔔 Pengingat: {text}"
+                    )
+                    # Hapus pengingat setelah dikirim
+                    cur.execute("DELETE FROM reminders WHERE id = %s", (r_id,))
+                    conn.commit()
+                    logger.info(f"Reminder ID {r_id} sent and deleted.")
+                except Exception as send_e:
+                    logger.error(f"Error sending reminder ID {r_id}: {send_e}")
+                    # Jika gagal kirim, mungkin bot tidak punya akses ke chat, hapus saja
+                    cur.execute("DELETE FROM reminders WHERE id = %s", (r_id,))
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Error checking reminders: {e}")
+        finally:
+            cur.close()
+            conn.close()
+    else:
+        logger.error("Could not get database connection for reminder check.")
+
+def start_reminder_checker(application: ApplicationBuilder) -> None:
+    """Memulai thread untuk memeriksa pengingat secara periodik."""
+    def run_checker():
+        while True:
+            application.create_task(check_reminders(application))
+            threading.Event().wait(REMINDER_INTERVAL_SECONDS) # Tunggu sebelum cek lagi
+
+    checker_thread = threading.Thread(target=run_checker, daemon=True)
+    checker_thread.start()
+    logger.info("Reminder checker thread started.")
+
+# ======================================
+# FLASK WEBHOOK
+# ======================================
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Bot is running!"
+
+@app.route(f'/{BOT_TOKEN}', methods=['POST'])
+async def webhook():
+    """Menangani update dari Telegram melalui webhook."""
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    await application.process_update(update)
+    return "ok"
+
+# ======================================
+# MAIN FUNCTION
+# ======================================
+def main() -> None:
+    """Fungsi utama untuk menjalankan bot."""
+    global application
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Conversation Handler untuk /setreminder
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("setreminder", set_reminder)],
+        states={
+            SET_REMINDER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reminder_text)],
+            SET_REMINDER_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reminder_time)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("myreminders", my_reminders))
+    application.add_handler(conv_handler) # Tambahkan conversation handler
+
+    # Start the reminder checker in a separate thread
+    start_reminder_checker(application)
+
+    # Set webhook untuk Render
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Pastikan ini disetel di Render
+    if WEBHOOK_URL:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        )
+        logger.info(f"Webhook set to {WEBHOOK_URL}/{BOT_TOKEN}")
+    else:
+        logger.warning("WEBHOOK_URL not set. Bot will run in polling mode (not recommended for Render).")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
