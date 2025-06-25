@@ -1,7 +1,9 @@
-import logging
 import os
+import logging
+import threading
 import psycopg2
 from datetime import datetime
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -11,187 +13,119 @@ from telegram.ext import (
     ConversationHandler,
     filters
 )
-from dotenv import load_dotenv
 
-# Load environment variables
+# Konfigurasi Aplikasi
 load_dotenv()
-
-# Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 10000))
 
-# Logging setup
+# Setup Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-JUDUL, PENERIMA, DEADLINE, KETERANGAN = range(4)
-task_data = {}
+# Web Server untuk Health Check
+async def health_check(request):
+    return web.Response(text="Bot Telegram is running")
 
+def run_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    web.run_app(app, port=PORT)
+
+# Database Manager
 class DatabaseManager:
-    """Handles all database operations with connection pooling and error handling"""
-    
     @staticmethod
     def get_connection():
-        """Establish database connection with retry logic"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                conn = psycopg2.connect(
-                    DATABASE_URL,
-                    sslmode="require",
-                    connect_timeout=5,
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10
-                )
-                logger.info("Database connection established")
-                return conn
-            except psycopg2.OperationalError as e:
-                logger.warning(f"Connection attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                time.sleep(2)
+        try:
+            return psycopg2.connect(
+                DATABASE_URL,
+                sslmode="require",
+                connect_timeout=5
+            )
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
 
     @staticmethod
     def init_db():
-        """Initialize database tables"""
         try:
             with DatabaseManager.get_connection() as conn:
                 with conn.cursor() as cur:
-                    # Create tables if not exists
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS users (
                             user_id BIGINT PRIMARY KEY,
+                            username TEXT,
                             registered_at TIMESTAMP DEFAULT NOW()
                         )
                     """)
                     cur.execute("""
                         CREATE TABLE IF NOT EXISTS tasks (
                             id SERIAL PRIMARY KEY,
-                            creator_id BIGINT REFERENCES users(user_id),
-                            title TEXT NOT NULL,
-                            recipients TEXT NOT NULL,
-                            deadline TIMESTAMP NOT NULL,
+                            creator_id BIGINT,
+                            title TEXT,
+                            recipients TEXT,
+                            deadline TIMESTAMP,
                             note TEXT,
-                            status TEXT DEFAULT 'ongoing',
+                            status TEXT DEFAULT 'pending',
                             created_at TIMESTAMP DEFAULT NOW()
                         )
                     """)
                     conn.commit()
-                    logger.info("Database tables initialized")
         except Exception as e:
-            logger.critical(f"Database initialization failed: {e}")
+            logger.critical(f"Database init failed: {e}")
             raise
 
-# Authorization
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
-
-async def is_user(user_id: int) -> bool:
-    if user_id == OWNER_ID:
-        return True
-    try:
-        with DatabaseManager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
-                return cur.fetchone() is not None
-    except Exception as e:
-        logger.error(f"User check failed for {user_id}: {e}")
-        return False
-
-# Command handlers
+# Command Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message"""
     user = update.effective_user
-    welcome_msg = (
-        f"Halo {user.mention_markdown()}! 👋\n"
-        "Saya adalah Task Manager Bot.\n\n"
-        "🔹 Gunakan /addtask untuk membuat tugas baru\n"
-        "🔹 /listtasks untuk melihat tugas aktif"
+    await update.message.reply_text(
+        f"Halo {user.first_name}!\n"
+        "Gunakan /addtask untuk membuat tugas baru"
     )
-    
-    if is_owner(user.id):
-        welcome_msg += "\n\n👑 Anda adalah pemilik bot ini. Fitur tambahan:\n"
-        welcome_msg += "/adduser - Tambah pengguna baru\n"
-        welcome_msg += "/removeuser - Hapus pengguna\n"
-        welcome_msg += "/listusers - Lihat daftar pengguna"
-    
-    await update.message.reply_markdown(welcome_msg)
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add new user (owner only)"""
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Hanya owner yang bisa menambah pengguna")
+async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user(update.effective_user.id):
+        await update.message.reply_text("Anda tidak terdaftar!")
         return
+    
+    await update.message.reply_text("Masukkan judul tugas:")
+    return "GET_TITLE"
 
-    if not context.args:
-        await update.message.reply_text("Contoh: /adduser 123456789")
-        return
-
-    try:
-        user_id = int(context.args[0])
-        with DatabaseManager.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                    (user_id,)
-                )
-                conn.commit()
-        
-        await update.message.reply_text(f"✅ User {user_id} berhasil ditambahkan")
-        logger.info(f"User {user_id} added by {update.effective_user.id}")
-    except ValueError:
-        await update.message.reply_text("⚠️ ID harus berupa angka")
-    except Exception as e:
-        logger.error(f"Add user failed: {e}")
-        await update.message.reply_text("❌ Gagal menambahkan user")
-
-# [Tambahkan handler lainnya di sini...]
+# [Tambahkan lebih banyak handler sesuai kebutuhan...]
 
 def main():
-    """Main application setup"""
-    try:
-        # Initialize database
-        DatabaseManager.init_db()
+    # Jalankan web server di thread terpisah
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
 
-        # Build bot application
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Inisialisasi database
+    DatabaseManager.init_db()
 
-        # Add command handlers
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("adduser", add_user))
-        # [Tambahkan handler lainnya di sini...]
+    # Setup bot Telegram
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # Registrasi handler
+    app.add_handler(CommandHandler("start", start))
+    
+    # Conversation handler untuk membuat task
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("addtask", add_task)],
+        states={
+            "GET_TITLE": [MessageHandler(filters.TEXT, get_title)],
+            "GET_DESC": [MessageHandler(filters.TEXT, get_description)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    app.add_handler(conv_handler)
 
-        # Add conversation handler for task creation
-        conv_handler = ConversationHandler(
-            entry_points=[CommandHandler("addtask", start_add_task)],
-            states={
-                JUDUL: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_judul)],
-                PENERIMA: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_penerima)],
-                DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_deadline)],
-                KETERANGAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_keterangan)]
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-            conversation_timeout=300  # 5 menit timeout
-        )
-        app.add_handler(conv_handler)
-
-        # Start the bot
-        logger.info("Starting bot in polling mode...")
-        app.run_polling(
-            poll_interval=1,
-            timeout=20,
-            allowed_updates=Update.ALL_TYPES
-        )
-    except Exception as e:
-        logger.critical(f"Application failed: {e}")
-    finally:
-        logger.info("Application stopped")
+    # Mulai bot
+    logger.info("Bot starting...")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
