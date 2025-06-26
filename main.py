@@ -184,8 +184,8 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if conn:
             conn.close()
 
-# TASK MANAGEMENT (Conversation Handler)
-TASK_TITLE, TASK_RECIPIENTS, TASK_DEADLINE, TASK_NOTE = range(4)
+# TASK MANAGEMENT (Conversation Handler) - **MODIFIED**
+TASK_TITLE, ASK_RECIPIENTS, GET_RECIPIENTS, ASK_DEADLINE, GET_DEADLINE, TASK_NOTE_FINAL = range(6)
 
 async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Memulai alur pembuatan tugas."""
@@ -200,8 +200,36 @@ async def start_add_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima judul tugas."""
     context.user_data['task_data']['title'] = update.message.text.strip()
-    await update.message.reply_text("👥 Siapa penerima tugas ini? (Mohon gunakan ID numerik Telegram mereka, pisahkan dengan spasi jika lebih dari satu. Contoh: `123456789 987654321`)\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-    return TASK_RECIPIENTS
+    await update.message.reply_text(
+        "👥 Apakah Anda ingin menambahkan **penerima**? (Ketik `ya` atau `tidak`)\n\n"
+        "Ketik `/cancel` untuk membatalkan.",
+        parse_mode="Markdown"
+    )
+    return ASK_RECIPIENTS
+
+async def ask_recipients_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menanyakan apakah user ingin menambahkan penerima."""
+    choice = update.message.text.lower().strip()
+    user_id = update.effective_user.id
+
+    if choice == 'tidak':
+        context.user_data['task_data']['recipients'] = str(user_id) # Set diri sendiri sebagai penerima
+        await update.message.reply_text(
+            "⏰ Apakah Anda ingin menambahkan **deadline**? (Ketik `ya` atau `tidak`)\n\n"
+            "Ketik `/cancel` untuk membatalkan.",
+            parse_mode="Markdown"
+        )
+        return ASK_DEADLINE
+    elif choice == 'ya':
+        await update.message.reply_text(
+            "👥 Siapa penerima tugas ini? (Mohon gunakan ID numerik Telegram mereka, pisahkan dengan spasi jika lebih dari satu. Contoh: `123456789 987654321`)\n\n"
+            "Ketik `/cancel` untuk membatalkan.",
+            parse_mode="Markdown"
+        )
+        return GET_RECIPIENTS
+    else:
+        await update.message.reply_text("⚠️ Mohon ketik `ya` atau `tidak`.\n\nKetik `/cancel` untuk membatalkan.")
+        return ASK_RECIPIENTS
 
 async def get_task_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima daftar penerima tugas dan memvalidasinya."""
@@ -211,12 +239,36 @@ async def get_task_recipients(update: Update, context: ContextTypes.DEFAULT_TYPE
     for r_id_str in recipients_input.split():
         if not r_id_str.isdigit():
             await update.message.reply_text(f"⚠️ `{r_id_str}` bukan ID numerik yang valid. Mohon masukkan ID numerik Telegram yang dipisahkan spasi.\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-            return TASK_RECIPIENTS
+            return GET_RECIPIENTS
         recipient_ids.append(r_id_str)
 
     context.user_data['task_data']['recipients'] = " ".join(recipient_ids)
-    await update.message.reply_text("⏰ Kapan deadline tugas ini? Format: `YYYY-MM-DD HH:MM` (Contoh: `2025-07-01 15:00`)\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-    return TASK_DEADLINE
+    await update.message.reply_text(
+        "⏰ Apakah Anda ingin menambahkan **deadline**? (Ketik `ya` atau `tidak`)\n\n"
+        "Ketik `/cancel` untuk membatalkan.",
+        parse_mode="Markdown"
+    )
+    return ASK_DEADLINE
+
+async def ask_deadline_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menanyakan apakah user ingin menambahkan deadline."""
+    choice = update.message.text.lower().strip()
+
+    if choice == 'tidak':
+        # Default deadline: 7 hari dari sekarang
+        context.user_data['task_data']['deadline'] = datetime.now() + timedelta(days=7)
+        await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?\n\nKetik `/cancel` untuk membatalkan.")
+        return TASK_NOTE_FINAL
+    elif choice == 'ya':
+        await update.message.reply_text(
+            "⏰ Kapan deadline tugas ini? Format: `YYYY-MM-DD HH:MM` (Contoh: `2025-07-01 15:00`)\n\n"
+            "Ketik `/cancel` untuk membatalkan.",
+            parse_mode="Markdown"
+        )
+        return GET_DEADLINE
+    else:
+        await update.message.reply_text("⚠️ Mohon ketik `ya` atau `tidak`.\n\nKetik `/cancel` untuk membatalkan.")
+        return ASK_DEADLINE
 
 async def get_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima deadline tugas dan memvalidasinya."""
@@ -226,14 +278,14 @@ async def get_task_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if deadline_dt < datetime.now():
             await update.message.reply_text("⚠️ Deadline tidak bisa di masa lalu. Mohon masukkan tanggal dan waktu di masa depan.\n\nKetik `/cancel` untuk membatalkan.")
-            return TASK_DEADLINE
+            return GET_DEADLINE
 
         context.user_data['task_data']['deadline'] = deadline_dt
         await update.message.reply_text("📌 Terakhir, apa keterangan atau detail tugasnya?\n\nKetik `/cancel` untuk membatalkan.")
-        return TASK_NOTE
+        return TASK_NOTE_FINAL
     except ValueError:
         await update.message.reply_text("⚠️ Format deadline salah. Mohon ikuti format `YYYY-MM-DD HH:MM`. Contoh: `2025-07-01 15:00`\n\nKetik `/cancel` untuk membatalkan.", parse_mode="Markdown")
-        return TASK_DEADLINE
+        return GET_DEADLINE
 
 async def save_task_and_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menerima keterangan tugas, menyimpan ke DB, dan mengirim notifikasi."""
@@ -646,14 +698,16 @@ def main():
     bot_application.add_handler(CommandHandler("adduser", add_user))
     bot_application.add_handler(CommandHandler("listusers", list_users))
 
-    # Task management ConversationHandler
+    # Task management ConversationHandler - MODIFIED ENTRY POINTS AND STATES
     task_conv_handler = ConversationHandler(
         entry_points=[CommandHandler("addtask", start_add_task)],
         states={
             TASK_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_title)],
-            TASK_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_recipients)],
-            TASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_deadline)],
-            TASK_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task_and_notify)],
+            ASK_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_recipients_choice)],
+            GET_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_recipients)],
+            ASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_deadline_choice)],
+            GET_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_task_deadline)],
+            TASK_NOTE_FINAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_task_and_notify)],
         },
         fallbacks=[CommandHandler("cancel", cancel_task_creation)],
     )
