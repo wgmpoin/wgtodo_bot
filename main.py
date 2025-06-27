@@ -3,10 +3,7 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler
-)
+from telegram.ext import ApplicationBuilder
 from telegram.constants import ParseMode
 from flask import Flask, request
 import httpx
