@@ -30,21 +30,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Halo! Bot siap digunakan.")
 
 # Init Telegram bot
-async def run_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    await app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-    return app
-
 import asyncio
-telegram_app = asyncio.run(run_bot())
+app = asyncio.run(
+    ApplicationBuilder().token(BOT_TOKEN).build()
+)
+app.add_handler(CommandHandler("start", start))
+asyncio.run(app.bot.set_webhook(f"{WEBHOOK_URL}/webhook"))
 
 # Flask webhook route
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
     if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
-        telegram_app.update_queue.put_nowait(update)
+        update = Update.de_json(request.get_json(force=True), app.bot)
+        app.update_queue.put_nowait(update)
         return "OK"
 
 # Run Flask
