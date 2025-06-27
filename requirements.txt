@@ -1,4 +1,4 @@
 python-telegram-bot==20.3
-flask
+flask>=2.0.0
 gunicorn
 python-dotenv
