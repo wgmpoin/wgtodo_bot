@@ -1,18 +1,23 @@
-import os
-import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler
 from flask import Flask, request
+import os
 
-# Config
 TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not all([TOKEN, WEBHOOK_URL]):
-    raise RuntimeError("Missing required environment variables!")
-
-# Initialize
 app = Application.builder().token(TOKEN).build()
 flask_app = Flask(__name__)
 
-# [Rest of your code... tetap sama seperti sebelumnya]
+# Handler sederhana
+async def start(update, context):
+    await update.message.reply_text("Bot berjalan!")
+
+app.add_handler(CommandHandler("start", start))
+
+@flask_app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(), app.bot)
+    app.update_queue.put(update)
+    return "OK", 200
+
+if __name__ == "__main__":
+    flask_app.run(host='0.0.0.0', port=os.getenv("PORT", 8080))
