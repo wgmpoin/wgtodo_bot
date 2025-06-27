@@ -28,7 +28,7 @@ import asyncio telegram_app = asyncio.run(run_bot())
 
 Flask route to receive webhook
 
-@flask_app.route("/webhook", methods=["POST"]) def webhook(): if request.method == "POST": update = telegram_app.update_queue.put_nowait(Update.de_json(request.get_json(force=True), telegram_app.bot)) return "OK"
+@flask_app.route("/webhook", methods=["POST"]) def webhook(): if request.method == "POST": update = Update.de_json(request.get_json(force=True), telegram_app.bot) telegram_app.update_queue.put_nowait(update) return "OK"
 
 Run Flask
 
