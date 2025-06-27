@@ -1,35 +1,41 @@
 import os
 import logging
-import httpx
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler, filters,
+    ContextTypes, ConversationHandler
 )
 from telegram.constants import ParseMode
 from flask import Flask, request
+import httpx
 
+# Load .env
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # kamu isi nanti
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Flask app for webhook
 app = Flask(__name__)
-telegram_app = None  # kita isi nanti setelah ApplicationBuilder selesai
+telegram_app = None  # global reference
 
+# State untuk ConversationHandler
 ADD_TITLE, ADD_RECIPIENTS, ADD_DEADLINE, ADD_NOTE = range(4)
 TEMP_TASK = {}
 
+# Command /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Halo! Gunakan /addtask untuk membuat tugas.")
 
+# Mulai tambah tugas
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TEMP_TASK[update.effective_chat.id] = {"creator_id": update.effective_user.id}
     await update.message.reply_text("Masukkan judul tugas:")
@@ -75,13 +81,13 @@ async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     async with httpx.AsyncClient() as client:
-        r = await client.post(f"{SUPABASE_URL}/rest/v1/tasks", headers=headers, json=payload)
+        res = await client.post(f"{SUPABASE_URL}/rest/v1/tasks", headers=headers, json=payload)
 
-    if r.status_code in [200, 201]:
-        await update.message.reply_text("✅ Tugas berhasil ditambahkan!")
+    if res.status_code in [200, 201]:
+        await update.message.reply_text("✅ Tugas berhasil ditambahkan.")
     else:
         await update.message.reply_text("❌ Gagal menambahkan tugas.")
-        logger.error(r.text)
+        logger.error(res.text)
 
     return ConversationHandler.END
 
@@ -90,42 +96,41 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Proses dibatalkan.")
     return ConversationHandler.END
 
+# Flask route untuk webhook
 @app.route("/webhook", methods=["POST"])
 def webhook_handler():
     if telegram_app:
-        telegram_app.update_queue.put_nowait(Update.de_json(request.json, telegram_app.bot))
-    return "ok"
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        telegram_app.update_queue.put_nowait(update)
+    return "OK"
+
+# Main async
+async def run_bot():
+    global telegram_app
+
+    telegram_app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Handler
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("addtask", add_task_start)],
+        states={
+            ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
+            ADD_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_recipients)],
+            ADD_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_deadline)],
+            ADD_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_note)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(conv)
+
+    await telegram_app.initialize()
+    await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+    await telegram_app.start()
+    logger.info("Bot webhook aktif")
 
 if __name__ == "__main__":
-    async def main():
-        global telegram_app
-        telegram_app = (
-            ApplicationBuilder()
-            .token(BOT_TOKEN)
-            .build()
-        )
-
-        conv = ConversationHandler(
-            entry_points=[CommandHandler("addtask", add_task_start)],
-            states={
-                ADD_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
-                ADD_RECIPIENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_recipients)],
-                ADD_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_deadline)],
-                ADD_NOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_note)],
-            },
-            fallbacks=[CommandHandler("cancel", cancel)],
-        )
-
-        telegram_app.add_handler(CommandHandler("start", start))
-        telegram_app.add_handler(conv)
-
-        await telegram_app.initialize()
-        await telegram_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
-        await telegram_app.start()
-        await telegram_app.updater.start_polling()  # untuk internal queue update
-        logger.info("Bot webhook aktif.")
-
     import asyncio
-    asyncio.run(main())
-
+    asyncio.run(run_bot())
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
