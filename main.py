@@ -9,42 +9,50 @@ from telegram.ext import (
 )
 from flask import Flask, request
 
-# Load .env
+# Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # contoh: https://namabot.onrender.com
 PORT = int(os.environ.get("PORT", 8080))
 
 # Logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # Flask app
 flask_app = Flask(__name__)
 
-# Command handler
+# Telegram handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Halo! Bot siap digunakan.")
+    await update.message.reply_text("Halo! Bot siap dipakai.")
 
-# Init Telegram bot
-import asyncio
-app = asyncio.run(
-    ApplicationBuilder().token(BOT_TOKEN).build()
-)
-app.add_handler(CommandHandler("start", start))
-asyncio.run(app.bot.set_webhook(f"{WEBHOOK_URL}/webhook"))
+# Build Telegram app
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(CommandHandler("start", start))
 
-# Flask webhook route
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), app.bot)
-        app.update_queue.put_nowait(update)
-        return "OK"
+    async def process_update():
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
+    
+    # Run the async function in the event loop
+    application.create_task(process_update())
+    return "OK"
 
-# Run Flask
+# Set webhook saat startup
+async def set_webhook():
+    await application.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+
+# Run the Flask app
 if __name__ == "__main__":
+    # Set the webhook when starting
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(set_webhook())
+    
+    # Start Flask
     flask_app.run(host="0.0.0.0", port=PORT)
