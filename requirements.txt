@@ -1,3 +1,6 @@
-supabase==1.0.3  # Downgrade ke versi stabil
-httpx==0.23.0
 python-telegram-bot==20.3
+supabase==1.0.3
+httpx==0.23.0
+flask==2.2.5
+gunicorn==21.2.0
+python-dotenv==1.0.0
