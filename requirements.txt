@@ -1,6 +1,7 @@
 python-telegram-bot==20.3
 supabase==2.3.1
-httpx[http2]==0.24.1  # Versi yang cocok dengan PTB 20.3
+httpx[http2]==0.24.1
 flask==2.2.5
 gunicorn==21.2.0
 python-dotenv==1.0.0
+gevent==23.9.1  # <-- Tambahkan ini
