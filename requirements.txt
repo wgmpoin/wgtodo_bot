@@ -12,5 +12,4 @@ gunicorn==21.2.0  # Opsi 1: Gunicorn standar
 uvicorn==0.27.0   # Opsi 2: Alternatif Uvicorn (lebih cepat)
 
 # OPSIONAL (Hanya jika pakai gevent)
-gevent==22.10.2
 greenlet==3.0.1
