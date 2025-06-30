@@ -2,14 +2,12 @@
 python-telegram-bot==20.3
 supabase==2.3.1
 flask==2.2.5
-
-# DEPENDENCIES
 httpx[http2]==0.24.1
-python-dotenv==1.0.0
 
-# SERVER (Pilih salah satu opsi)
-gunicorn==21.2.0  # Opsi 1: Gunicorn standar
-uvicorn==0.27.0   # Opsi 2: Alternatif Uvicorn (lebih cepat)
+# SERVER (PILIH SALAH SATU)
+gunicorn==21.2.0  # Opsi 1
+uvicorn==0.27.0   # Opsi 2 (lebih modern)
 
-# OPSIONAL (Hanya jika pakai gevent)
-greenlet==3.0.1
+# HAPUS SEMUA BARIS BERIKUT:
+# gevent==xx.x.x
+# greenlet==xx.x.x
