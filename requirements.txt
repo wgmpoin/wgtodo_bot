@@ -1,4 +1,4 @@
-python-telegram-bot==13.7  # Versi stabil lama
+python-telegram-bot==20.3
 supabase==1.0.3
 flask==2.2.5
 gunicorn==21.2.0
