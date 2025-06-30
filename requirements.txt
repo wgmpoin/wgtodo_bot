@@ -1,13 +1,6 @@
-# CORE
 python-telegram-bot==20.3
-supabase==2.3.1
+supabase==1.0.3
 flask==2.2.5
-httpx[http2]==0.24.1
-
-# SERVER (PILIH SALAH SATU)
-gunicorn==21.2.0  # Opsi 1
-uvicorn==0.27.0   # Opsi 2 (lebih modern)
-
-# HAPUS SEMUA BARIS BERIKUT:
-# gevent==xx.x.x
-# greenlet==xx.x.x
+httpx==0.23.0
+gunicorn==21.2.0
+python-dotenv==1.0.0
